@@ -9,7 +9,9 @@ Per a poder executar l'aplicació es necessari tenir instalat això:
 - `redis`
 - `pika`
 - Un servidor Redis en execució
-- Un servidor RabbitMQ en execució: sudo docker run -d --rm --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
+- Un servidor RabbitMQ en execució:
+- sudo docker rm rabbitmq 
+- sudo docker run -d --rm --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
 
 Podeu instal·lar les dependències necessàries mitjançant pip3 dintre del entorn virtual:
 
@@ -54,7 +56,7 @@ Se us demanarà el vostre nom d'usuari, es important escollir 1 dels 4 noms d'us
 
 1. Connectar-se a un xat privat
 2. Subscriure’s a un xat grupal
-3. Descobrir xats actius
+3. Descobrir a un xat actiu
 4. Accedir al canal d'insults
 
 ### Opcions del Client
@@ -69,7 +71,7 @@ Introduïu l'ID del grup al qual voleu subscriure-vos. Un cop subscrits, podreu 
 
 #### 3. Descobrir Xats Actius
 
-El client enviarà una sol·licitud per descobrir altres xats actius. Els resultats es mostraran al terminal.
+El client enviarà una sol·licitud per descobrir a un altre client que estigui disponible
 
 #### 4. Accedir al Canal d'Insults
 

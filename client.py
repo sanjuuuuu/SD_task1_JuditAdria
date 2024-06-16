@@ -1,8 +1,8 @@
+from concurrent import futures
 import grpc
 import chat_pb2
 import chat_pb2_grpc
 import pika
-from concurrent import futures
 import threading
 import time
 
@@ -15,11 +15,9 @@ class ClientOperationsService(chat_pb2_grpc.ClientOperationsServicer):
         self.port = None
         self.user_channel = None
         self.user_stub = None
-        self.rabbitmq_connection = None
-        self.rabbitmq_channel = None
         self.rabbitmq_exchange = None
-        self.stop_thread = threading.Event()
-        self.stop_discovery_thread = threading.Event()
+        self.stop_event = threading.Event()
+        self.listener_threads = []
 
     def user_login(self):
         request = chat_pb2.UserLoginRequest(user_name=self.user_name)
@@ -32,6 +30,7 @@ class ClientOperationsService(chat_pb2_grpc.ClientOperationsServicer):
                 return response.port_number
             else:
                 print(f"{response.msg}")
+                return None
         except grpc.RpcError as e:
             print(f"gRPC Error: {e}")
             return None
@@ -51,6 +50,7 @@ class ClientOperationsService(chat_pb2_grpc.ClientOperationsServicer):
                 return False
         except grpc.RpcError as e:
             print(f"gRPC Error: {e}")
+            return False
 
     def send_chat_message(self, chat_id, message):
         request = chat_pb2.ChatMessageRequest(from_user=self.user_name, chat_message=message)
@@ -71,141 +71,161 @@ class ClientOperationsService(chat_pb2_grpc.ClientOperationsServicer):
         self.server.add_insecure_port(f'[::]:{port}')
         self.server.start()
         print("Type 'exit' to leave.")
-        while True:
-            message = input("")
-            if message.lower() == "exit":
-                request = chat_pb2.UserConnectionRequest(user_name=self.user_name, chat_id=chat_id)
-                self.server_stub.Disconnect(request)
-                break
-            client.send_chat_message(chat_id, message)
-            request = chat_pb2.UserConnectionRequest(user_name=self.user_name, chat_id=chat_id)
-            response = self.server_stub.DisconnectUser(request)
-            if response.is_success:
-                break
-        self.server.stop(0)
-
-    def setup_rabbitmq(self, chat_id):
         try:
-            self.rabbitmq_connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
-            self.rabbitmq_channel = self.rabbitmq_connection.channel()
-            self.rabbitmq_exchange = chat_id
-            self.rabbitmq_channel.exchange_declare(exchange=self.rabbitmq_exchange, exchange_type='fanout')
-        except pika.exceptions.AMQPError as e:
-            print(f"RabbitMQ Error: {e}")
+            while True:
+                message = input("")
+                if message.lower() == "exit":
+                    request = chat_pb2.UserConnectionRequest(user_name=self.user_name, chat_id=chat_id)
+                    self.server_stub.Disconnect(request)
+                    break
+                client.send_chat_message(chat_id, message)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.server.stop(0)
+
+    def setup_rabbitmq(self, exchange_name):
+        connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+        channel = connection.channel()
+        self.rabbitmq_exchange = exchange_name
+        channel.exchange_declare(exchange=self.rabbitmq_exchange, exchange_type='fanout')
+        return connection, channel
 
     def subscribe_to_group_chat(self, chat_id):
-        self.setup_rabbitmq(chat_id)
-        self.listener_thread = threading.Thread(target=self.listen_for_messages, args=(chat_id,))
-        self.listener_thread.start()
+        connection, channel = self.setup_rabbitmq(chat_id)
+        listener_thread = threading.Thread(target=self.listen_for_messages, args=(connection, channel, chat_id,))
+        listener_thread.start()
+        self.listener_threads.append(listener_thread)
 
-    def listen_for_messages(self, chat_id):
-        if self.rabbitmq_connection:
-            result = self.rabbitmq_channel.queue_declare(queue='', exclusive=True)
-            queue_name = result.method.queue
-            self.rabbitmq_channel.queue_bind(exchange=self.rabbitmq_exchange, queue=queue_name)
+    def listen_for_messages(self, connection, channel, chat_id):
+        result = channel.queue_declare(queue='', exclusive=True)
+        queue_name = result.method.queue
+        channel.queue_bind(exchange=self.rabbitmq_exchange, queue=queue_name)
 
-            def callback(ch, method, properties, body):
-                message = body.decode('utf-8')
-                print(f"{message}")
+        def callback(ch, method, properties, body):
+            message = body.decode('utf-8')
+            print(f"{message}")
 
-            self.rabbitmq_channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
-            print(f"Subscribed to {chat_id}. Waiting for messages...")
-            while not self.stop_thread.is_set():
-                self.rabbitmq_channel.connection.process_data_events()
-        else:
-            print("Failed to connect to RabbitMQ.")
+        channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
+        print(f"Subscribed to {chat_id}. Waiting for messages...")
+        try:
+            while not self.stop_event.is_set():
+                connection.process_data_events(time_limit=1)
+        except Exception as e:
+            print(f"Error in listen_for_messages: {e}")
+        finally:
+            if connection.is_open:
+                connection.close()
 
     def send_group_message(self, chat_id):
-        if not self.rabbitmq_connection:
-            print("Failed to connect to RabbitMQ")
-            return
-        while True:
-            message = input("")
-            if message.lower() == "exit":
-                print("Closing connection...")
-                self.stop_thread.set()
-                break
-            message = f"{self.user_name}: {message}"
-            self.rabbitmq_channel.basic_publish(exchange=self.rabbitmq_exchange, routing_key='', body=message.encode('utf-8'))
-        self.rabbitmq_connection.close()
+        connection, channel = self.setup_rabbitmq(chat_id)
+        try:
+            while True:
+                message = input("")
+                if message.lower() == "exit":
+                    print("Closing connection...")
+                    break
+                message = f"{self.user_name}: {message}"
+                channel.basic_publish(exchange=self.rabbitmq_exchange, routing_key='', body=message.encode('utf-8'))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if connection.is_open:
+                connection.close()
 
     def discover_chats(self):
-        self.setup_rabbitmq('discovery')
-        self.publish_discovery_event()
-        self.discovery_thread = threading.Thread(target=self.listen_for_discovery)
-        self.discovery_thread.start()
-        self.stop_discovery_thread.wait()
+        connection, channel = self.setup_rabbitmq('discovery')
+        self.publish_discovery_event(channel)
+        listener_thread = threading.Thread(target=self.listen_for_discovery, args=(connection, channel,))
+        listener_thread.start()
+        self.listener_threads.append(listener_thread)
+        time.sleep(5)  # Wait for responses
+        self.stop_event.set()  # Signal the listener thread to stop
+        listener_thread.join()  # Wait for the listener thread to finish
+        if connection.is_open:
+            connection.close()
 
-    def publish_discovery_event(self):
-        self.rabbitmq_channel.exchange_declare(exchange='discovery', exchange_type='fanout')
+    def publish_discovery_event(self, channel):
+        channel.exchange_declare(exchange='discovery', exchange_type='fanout')
         discovery_message = f"{self.user_name}: {self.ip}:{self.port}"
-        self.rabbitmq_channel.basic_publish(exchange='discovery', routing_key='', body=discovery_message.encode('utf-8'))
+        channel.basic_publish(exchange='discovery', routing_key='', body=discovery_message.encode('utf-8'))
         request = chat_pb2.UserLoginRequest(user_name=self.user_name)
         self.server_stub.DiscoverUsers(request)
 
-    def listen_for_discovery(self):
-        result = self.rabbitmq_channel.queue_declare(queue='', exclusive=True)
+    def listen_for_discovery(self, connection, channel):
+        result = channel.queue_declare(queue='', exclusive=True)
         queue_name = result.method.queue
-        self.rabbitmq_channel.queue_bind(exchange='discovery', queue=queue_name)
+        channel.queue_bind(exchange='discovery', queue=queue_name)
 
         def callback(ch, method, properties, body):
             response = body.decode('utf-8')
-            users = response.split('\n')
             print("Active chats:")
-            for user in users:
-                print(user)
-            self.stop_discovery_thread.set()
+            print(response)
 
-        self.rabbitmq_channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
-        while not self.stop_discovery_thread.is_set():
-            self.rabbitmq_channel.connection.process_data_events()
+        channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
+        print("Waiting for discovery messages...")
+        try:
+            while not self.stop_event.is_set():
+                connection.process_data_events(time_limit=1)
+        except Exception as e:
+            print(f"Error in listen_for_discovery: {e}")
+        finally:
+            if connection.is_open:
+                connection.close()
 
     def setup_rabbitmq_queue(self, queue_name):
-        try:
-            self.rabbitmq_connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
-            self.rabbitmq_channel = self.rabbitmq_connection.channel()
-            self.rabbitmq_channel.queue_declare(queue=queue_name, durable=True)  # Ensure durable is True
-        except pika.exceptions.AMQPError as e:
-            print(f"RabbitMQ Error: {e}")
+        connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+        channel = connection.channel()
+        channel.queue_declare(queue=queue_name, durable=True)
+        return connection, channel
 
     def subscribe_to_insult_queue(self, queue_name):
-        self.setup_rabbitmq_queue(queue_name)
-        self.insult_thread = threading.Thread(target=self.listen_for_insults, args=(queue_name,))
-        self.insult_thread.start()
+        connection, channel = self.setup_rabbitmq_queue(queue_name)
+        insult_thread = threading.Thread(target=self.listen_for_insults, args=(connection, channel, queue_name,))
+        insult_thread.start()
+        self.listener_threads.append(insult_thread)
 
-    def listen_for_insults(self, queue_name):
-        if self.rabbitmq_connection:
-            def callback(ch, method, properties, body):
-                message = body.decode('utf-8')
-                print(f"{message}")
+    def listen_for_insults(self, connection, channel, queue_name):
+        def callback(ch, method, properties, body):
+            message = body.decode('utf-8')
+            print(f"{message}")
 
-            self.rabbitmq_channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
-            while not self.stop_thread.is_set():
-                self.rabbitmq_channel.connection.process_data_events()
-        else:
-            print("Failed to connect")
+        channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
+        try:
+            while True:
+                connection.process_data_events(time_limit=1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if connection.is_open:
+                connection.close()
 
     def send_insult(self, queue_name):
-        if not self.rabbitmq_connection:
-            print("Failed to connect")
-            return
-        while True:
-            message = input("")
-            if message.lower() == "exit":
-                print("Closing connection...")
-                self.stop_thread.set()
-                break
-            message = f"{self.user_name}: {message}"
-            self.rabbitmq_channel.basic_publish(exchange='', routing_key=queue_name, body=message.encode('utf-8'))
-        self.rabbitmq_connection.close()
+        connection, channel = self.setup_rabbitmq_queue(queue_name)
+        try:
+            while True:
+                message = input("")
+                if message.lower() == "exit":
+                    print("Closing connection...")
+                    break
+                message = f"{self.user_name}: {message}"
+                channel.basic_publish(exchange='', routing_key=queue_name, body=message.encode('utf-8'))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if connection.is_open:
+                connection.close()
 
+    def cleanup(self):
+        # Clean up all threads
+        self.stop_event.set()
+        for thread in self.listener_threads:
+            thread.join()
 
 if __name__ == "__main__":
     user_name = input("Login: ")
     client = ClientOperationsService(user_name)
     port = client.user_login()
-    client.rabbitmq_connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
-    client.rabbitmq_channel = client.rabbitmq_connection.channel()
     if port:
         while True:
             print("\n1. Connect to Chat")
@@ -225,8 +245,9 @@ if __name__ == "__main__":
             elif choice == "3":
                 client.discover_chats()
             elif choice == "4":
-                queue_name = "insult_channel"
+                queue_name = "insults"
+                print(f"Subscribed to {queue_name} channel. Waiting for insults...")
                 client.subscribe_to_insult_queue(queue_name)
                 client.send_insult(queue_name)
             else:
-                print("Invalid option. Try again.")
+                print("Invalid choice. Please select a valid option.")
